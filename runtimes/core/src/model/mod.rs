@@ -165,9 +165,9 @@ impl Request {
     pub fn has_authenticated_user(&self) -> bool {
         match &self.data {
             RequestData::RPC(data) => data.auth_user_id.is_some(),
+            RequestData::Stream(data) => data.auth_user_id.is_some(),
             RequestData::Auth(_) => false,
             RequestData::PubSub(_) => false,
-            RequestData::Stream(_) => false,
         }
     }
 

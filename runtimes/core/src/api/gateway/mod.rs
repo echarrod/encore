@@ -1,12 +1,16 @@
 mod router;
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Context;
 use axum::async_trait;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use bytes::{BufMut, Bytes, BytesMut};
+use http::header::SEC_WEBSOCKET_PROTOCOL;
 use hyper::header;
 use pingora::http::{RequestHeader, ResponseHeader};
 use pingora::protocols::http::error_resp;
@@ -15,6 +19,7 @@ use pingora::server::configuration::{Opt, ServerConf};
 use pingora::services::Service;
 use pingora::upstreams::peer::HttpPeer;
 use pingora::{Error, ErrorSource, ErrorType};
+use serde::Deserialize;
 use tokio::sync::watch;
 use url::Url;
 
@@ -295,13 +300,23 @@ impl ProxyHttp for Gateway {
                 upstream_request.insert_header(header::HOST, host)?;
             }
 
+            if session.is_upgrade_req() {
+                update_request_from_websocket_protocol(upstream_request).map_err(|e| {
+                    Error::because(
+                        ErrorType::UnknownError,
+                        "failed parsing websocket protocol header",
+                        e,
+                    )
+                })?;
+            }
+
             let svc_auth_method = self
                 .inner
                 .service_registry
                 .service_auth_method(&gateway_ctx.upstream_service_name)
                 .unwrap_or_else(|| Arc::new(svcauth::Noop));
 
-            let headers = &session.req_header().headers;
+            let headers = &upstream_request.headers;
 
             let mut call_meta = CallMeta::parse_without_caller(headers).map_err(|e| {
                 Error::because(
@@ -334,7 +349,7 @@ impl ProxyHttp for Gateway {
 
             if let Some(auth_handler) = &self.inner.shared.auth {
                 let auth_response = auth_handler
-                    .authenticate(session.req_header(), call_meta.clone())
+                    .authenticate(upstream_request, call_meta.clone())
                     .await
                     .map_err(|e| {
                         Error::because(ErrorType::InternalError, "couldn't authenticate request", e)
@@ -425,6 +440,57 @@ impl ProxyHttp for Gateway {
 
         code
     }
+}
+
+#[derive(Deserialize)]
+struct AuthHeaders(HashMap<String, String>);
+
+const AUTH_DATA_PREFIX: &str = "encore.dev.auth_data.";
+
+// hack to be able to have browsers send request headers when setting up a websocket
+// inspired by https://github.com/kubernetes/kubernetes/commit/714f97d7baf4975ad3aa47735a868a81a984d1f0
+fn update_request_from_websocket_protocol(
+    upstream_request: &mut RequestHeader,
+) -> anyhow::Result<()> {
+    let headers = upstream_request
+        .headers
+        .get_all(SEC_WEBSOCKET_PROTOCOL)
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if upstream_request
+        .remove_header(&SEC_WEBSOCKET_PROTOCOL)
+        .is_none()
+    {
+        return Ok(());
+    }
+
+    for header_value in headers {
+        let mut filterd_protocols = Vec::new();
+
+        for protocol in header_value.to_str()?.split(',') {
+            let protocol = protocol.trim();
+            if protocol.starts_with(AUTH_DATA_PREFIX) {
+                let data = protocol.strip_prefix(AUTH_DATA_PREFIX).unwrap();
+                let decoded = URL_SAFE_NO_PAD.decode(data)?;
+                let auth_data: AuthHeaders = serde_json::from_slice(&decoded)?;
+
+                for (name, value) in auth_data.0 {
+                    // TODO: error on headers that are not allowed to be set
+                    upstream_request.append_header(name, value)?;
+                }
+            } else {
+                filterd_protocols.push(protocol);
+            }
+        }
+
+        if !filterd_protocols.is_empty() {
+            upstream_request.append_header(SEC_WEBSOCKET_PROTOCOL, filterd_protocols.join(", "))?;
+        }
+    }
+
+    Ok(())
 }
 
 fn as_api_error(err: &pingora::Error) -> Option<&api::Error> {
